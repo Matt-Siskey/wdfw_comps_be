@@ -1,0 +1,554 @@
+---
+title: "WDFW Age Composition Bootstrap Estimator"
+format: 
+  html:
+    toc: true
+    theme: sketchty
+    dark: darkly
+    embed-resources: true
+    self-contained-math: true
+    code-tools: true
+    code-fold: true
+editor: visual
+echo: true
+params:
+  current_year: 2024
+  sp: "Chum" #"Chinook" #"Coho" "Chum" "Pink"
+  system: "Wallace River" #"Puyallup River"
+---
+
+|                                                 |
+|:------------------------------------------------|
+| Last Updated `r format(Sys.time(), '%m/%d/%Y')` |
+
+\
+\
+
+# **Introduction**
+
+This script contains a bootstrap estimator for otolith samples collected where various hypothetical sampling rate scenarios (10-100% by 10% increments) are explored. Simulated age compositions are produced for a number of bootstrap samples designated by the user by stepping through the reported sampling dates for each year included and sampling otolith ages at the specified rate for each treatment. Effective sample size is then calculated for each sampling rate treatment and summarized as the harmonic mean (Stewart & Hamel, 2014; Eq. 6) across bootstrap replicates.
+
+## Setup, pull data, and format
+
+Use this section to load libraries, set directories, and designate any life history or geographic groupings. Then read in the data, calculate brood year returns, and format for model fitting.
+
+```{r setup, message=FALSE, warning=FALSE}
+#####################################################################################################################################################
+### Clear workspace
+rm(list=ls())
+
+### Load libraries
+library(ggplot2);library(ggh4x);library(ggthemes);library(ggeffects);library(kableExtra);
+library(tidyr);library(dplyr);library(data.table);library(purrr);library(readr)
+library(lubridate);library(janitor);library(stringi);library(rmdformats);
+library(nlme);library(MuMIn);library(Hmisc);library(mgcv);library(scales);
+library(odbc);library(RODBC);library(DBI);library(stringr);library(mgcv);
+library(RJSONIO);library(RCurl);library(httr);library(jsonlite);library(glmmTMB);
+
+### Set up drives, seed, & controls
+drive          <-paste0("C:/Users/sism1477/OneDrive - Washington State Executive Branch Agencies/Desktop/R5 HM&E/wdfw_age_be/")
+`%nin%`        <-negate(`%in%`) # create an exclude operator
+# source(paste(drive,"/Functions/Functions.R",sep="")) #Source seed function to create seedlist; only run once then turn off
+load(paste(drive,"/seed.list_v2",sep="")) #load seed folder again
+bootest.seed <- as.numeric(seed.list[[1]][,"bootest.seed3"]) #read recruitment seed from seedlist function
+n_boot <-1000 # settled on 1000
+
+### Species designations
+sp_name_list  <-c("Chum") #, "chinook", "pink", "coho", "sockeye", "steelhead", "cutthroat", "rainbow", "bull trout"
+
+### Read-in age data & calc real age comps
+# chum25                    <-read.csv(paste0(drive,"chum_ages_wallace_2025.csv"))
+chum24                    <-read.csv(paste0(drive,"chum_ages_wallace_2024.csv"))
+chum20_23                 <-read.csv(paste0(drive,"chum_ages_wallace_2020-2023.csv"))
+age_data                  <-rbind(chum24[,c("species_description","location_name","sample_datetime", "gilbert_rich")],
+                                  # chum25[,c("species_description","location_name","sample_datetime", "gilbert_rich")],
+                                  chum20_23[,c("species_description","location_name","sample_datetime", "gilbert_rich")])
+age_data                  <-filter(age_data, gilbert_rich!=c("Unreadable"))
+age_data$return_yr        <-as.character(substr(age_data$sample_datetime,1,4))
+age_data$return_yr        <-as.numeric(age_data$return_yr)
+age_data$month_date       <-as.character(substr(age_data$sample_datetime,6,10))
+age_data$gilbert_rich_int <-substr(chartr("₀₁₂₃₄₅₆₇₈₉", "0123456789", age_data$gilbert_rich),1,1)
+age_data$gilbert_rich_int <-as.numeric(age_data$gilbert_rich_int)
+
+# Calculate N_bt
+calculate_n = function(boot_ct, obs_ct){
+  # boot_ct  = standardize(boot_ct)
+  # obs_ct   = standardize(obs_ct)
+  num_ct   = boot_ct*(1-boot_ct)
+  denom_ct = (boot_ct - obs_ct)^2
+  colSums(num_ct)/colSums(denom_ct)
+}
+
+# Calculate harmonic mean of N_bt
+harmonic.mean = function(vec) 1/mean(1/vec)
+
+```
+
+# **Annual Estimator**
+
+Effective sample size is often used to gauge the level of information content present in each year of age composition data included in a stock assessment framework However, it can also be useful in a sampling design capacity to inform the agency on the quality of sampling efforts year-to-year. Therefore, this section of the script is designed to calculate an effective sample size for each sampling year and each user-specified sampling rate treatment.
+
+## Resample Age Data
+
+The available age data are bootstrapped 1,000 times per scenario (sp X yr X trt), thus creating 1,000 simulated age comps per scenario.
+
+```{r boot_yr}
+### Set up bootstrapping parameters
+age_comps_real_sp <-list()
+age_comps_sim_trt <-list()
+age_comps_sim_sp <-list()
+age_data_sim <-list()
+n_nom_sp <-list()
+samp_rate <-c(seq(0.1,1,0.1))
+# print(Sys.time())
+# sp=b=1
+# s=10
+# y=4
+
+for(sp in 1:length(sp_name_list)){
+  age_comps_real <-list()
+  n_nom_trt <-list()
+  yrs <-sort(unique(dplyr::filter(age_data, species_description==sp_name_list[sp])$return_yr))
+
+  for(s in 1:length(samp_rate)){
+    age_comps_b <-list()
+    n_nom_b <-list()
+    # print(samp_rate[[s]])
+    
+    for(b in 1:n_boot){
+      # print(b)
+      set.seed(bootest.seed[b])
+      age_comps_sim <-list()
+      n_nom_y <-list()
+      
+      for(y in 1:length(yrs)){
+        ### Calc real age comps for each year
+        age_data_sp_y <-dplyr::filter(age_data, species_description==sp_name_list[sp] & return_yr==yrs[y])
+        age_data_tab_real <-table(age_data_sp_y$gilbert_rich_int)
+    
+        age_vec   <-c(as.numeric(ifelse(is.na(age_data_tab_real["1"])==FALSE,age_data_tab_real["1"],0)),
+                        as.numeric(ifelse(is.na(age_data_tab_real["2"])==FALSE,age_data_tab_real["2"],0)),
+                        as.numeric(ifelse(is.na(age_data_tab_real["3"])==FALSE,age_data_tab_real["3"],0)),
+                        as.numeric(ifelse(is.na(age_data_tab_real["4"])==FALSE,age_data_tab_real["4"],0)),
+                        as.numeric(ifelse(is.na(age_data_tab_real["5"])==FALSE,age_data_tab_real["5"],0)),
+                        as.numeric(ifelse(is.na(age_data_tab_real["6"])==FALSE,age_data_tab_real["6"],0)))
+        
+        age_comps_real[[y]] <-age_vec/sum(age_vec)
+        
+        samp_dates <-unique(age_data_sp_y$month_date)
+        age_data_sim <-list()
+        
+        for(sd in 1:length(samp_dates)){
+          
+          # for(or in 1:length(origin)){
+            age_data_sp_y_sd <-dplyr::filter(age_data_sp_y, month_date==samp_dates[sd])
+            age_data_sim[[sd]] <-sample(age_data_sp_y_sd$gilbert_rich_int,size=floor(round(nrow(age_data_sp_y_sd)*samp_rate[s])),replace=TRUE)
+          # }
+        
+        }
+        names(age_data_sim) <-samp_dates
+        age_data_sim_df <-map_df(age_data_sim,~as.data.frame(.))
+        age_data_tab_sim <-table(age_data_sim_df)
+        
+        age_vec_sim<-c(as.numeric(ifelse(is.na(age_data_tab_sim["1"])==FALSE,age_data_tab_sim["1"],0)),
+                       as.numeric(ifelse(is.na(age_data_tab_sim["2"])==FALSE,age_data_tab_sim["2"],0)),
+                       as.numeric(ifelse(is.na(age_data_tab_sim["3"])==FALSE,age_data_tab_sim["3"],0)),
+                       as.numeric(ifelse(is.na(age_data_tab_sim["4"])==FALSE,age_data_tab_sim["4"],0)),
+                       as.numeric(ifelse(is.na(age_data_tab_sim["5"])==FALSE,age_data_tab_sim["5"],0)),
+                       as.numeric(ifelse(is.na(age_data_tab_sim["6"])==FALSE,age_data_tab_sim["6"],0)))
+  
+        n_nom_y[[y]] <-sum(age_vec_sim)
+        age_comps_sim[[y]] <-age_vec_sim/sum(age_vec_sim)
+      }
+      names(n_nom_y) <-yrs
+      n_nom_b[[b]] <-n_nom_y
+      names(age_comps_real) <-yrs
+      names(age_comps_sim) <-yrs
+      age_comps_b[[b]] <-age_comps_sim
+    }
+    n_nom_trt[[s]] <-n_nom_b
+    age_comps_sim_trt[[s]] <-age_comps_b
+  }
+  names(n_nom_trt) <-samp_rate
+  n_nom_sp[[sp]] <-n_nom_trt
+  age_comps_real_sp[[sp]] <-age_comps_real
+  names(age_comps_sim_trt) <-samp_rate
+  age_comps_sim_sp[[sp]] <-age_comps_sim_trt
+}
+names(n_nom_sp) <-sp_name_list
+names(age_comps_real_sp) <-sp_name_list
+names(age_comps_sim_sp) <-sp_name_list
+
+for(sp in 1:length(sp_name_list)){
+  for(s in 1:length(samp_rate)){
+    if(s==1){age_comps_sim_df <-cbind(as.data.frame(t(map_df(age_comps_sim_sp[[sp]][[s]],~as.data.frame(.)))),yrs)}
+    if(s>1){
+      temp <-cbind(as.data.frame(t(map_df(age_comps_sim_sp[[sp]][[s]],~as.data.frame(.)))),yrs)
+      age_comps_sim_df <-rbind(temp, age_comps_sim_df)
+    }
+  }
+}
+
+# Table of samples taken per sampling date
+sample_tab <-t(table(age_data[,c("return_yr","month_date")]))
+tab_with_sums <- addmargins(sample_tab, 1) # 1 specifies adding row margins (sums of columns)
+tab_with_sums %>% 
+  kbl(row.names = TRUE, caption = "Table 1. Count of samples taken on each sampling date.") %>%
+  kable_classic(full_width = F, position = "left", html_font = "Cambria", fixed_thead = T)
+
+# Plot of sample count by sampling date
+ggplot(data = age_data[,c("return_yr","month_date")], aes(x = month_date)) +
+  geom_bar(fill = "steelblue", color = "white")+
+  facet_wrap(return_yr~.)+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) # Angle x-axis labels for readability
+
+age_comps_real <-rbindlist(age_comps_real_sp, fill=FALSE)
+age_comps_real %>% 
+  kbl(row.names = TRUE, caption = "Table 2. Real age compositions calcualted for each year of sampling.") %>%
+  kable_classic(full_width = F, position = "left", html_font = "Cambria", fixed_thead = T)
+
+# print(Sys.time())
+
+
+```
+
+## Calculate data weights (n_eff) & plot
+
+The simulated age comps are then compared to the real age comps using the following calculation:
+
+INSERT EQ. 6 HERE
+
+and the n_eff is calculated as the harmonic mean across bootstrap replicates.
+
+```{r inputSS_yr}
+# Set 'observed' proportions to real annual age comps, calc N_bt
+# Could use mean of specimen bootstrap replicates if implemented 
+samp_suite_sp <-list()
+
+for(sp in 1:length(sp_name_list)){
+  samp_suite <-list()
+  
+  for(trt in 1:length(samp_rate)){
+    N_bt = matrix(NA, nrow=n_boot, ncol=length(yrs))
+    colnames(N_bt) <-yrs
+    # print(samp_rate[[trt]])
+    
+    for(y in 1:length(yrs)){
+      for(bI in 1:n_boot){
+        N_bt[bI,y] = t(calculate_n(boot_ct=map_df(age_comps_sim_sp[[sp]][[trt]][[bI]][[y]],~as.data.frame(.)), 
+                                  obs_ct=map_df(age_comps_real_sp[[sp]][[y]],~as.data.frame(.))))
+      }
+    }
+    # # Calculate input sample size (harmonic mean across bootstrap samples)
+    Nsamp_t = array(NA,dim=length(yrs))
+    Nsamp_t = apply(N_bt, MARGIN=2, FUN=harmonic.mean)
+    samp_suite[[trt]] <-Nsamp_t
+
+  }
+  names(samp_suite) <-samp_rate
+  samp_suite_sp[[sp]] <-samp_suite
+}
+names(samp_suite_sp) <-sp_name_list
+
+fig_dat                <-map_df(samp_suite_sp,~as.data.frame(.))
+colnames(fig_dat)      <-samp_rate
+fig_dat$return_yr      <-rownames(fig_dat)
+fig_dat_long           <-melt(setDT(fig_dat), id.vars = c("return_yr"), variable.name = "trt")
+colnames(fig_dat_long) <-c("return_yr", "trt", "n_eff")
+fig_dat_long           <-fig_dat_long[order(fig_dat_long$return_yr,fig_dat_long$trt),]
+
+for(sp in 1:length(sp_name_list)){
+  for(s in 1:length(samp_rate)){
+    if(s==1){
+      n_nom_df <-rbindlist(n_nom_sp[[sp]][[s]], fill=FALSE)
+      n_nom_df$trt <-rep(samp_rate[[s]], n_boot)
+    }
+    if(s>1){
+      temp <-rbindlist(n_nom_sp[[sp]][[s]], fill=FALSE)
+      temp$trt <-rep(samp_rate[[s]], n_boot)
+      n_nom_df <-rbind(n_nom_df, temp)
+    }
+  }
+}
+
+n_nom_df_long           <-melt(setDT(n_nom_df), id.vars = c("trt"), variable.name = "return_yr")
+colnames(n_nom_df_long) <-c("trt","return_yr","n_nom")
+n_nom_means             <-aggregate(n_nom ~ trt + return_yr, data = n_nom_df_long, FUN = mean)
+n_nom_means$return_yr   <-as.character(n_nom_means$return_yr)
+n_nom_means$trt         <-as.factor(n_nom_means$trt)
+fig_dat_long            <-left_join(fig_dat_long, n_nom_means, by = c("return_yr","trt"))
+fig_dat_long$n_diff     <-fig_dat_long$n_nom - fig_dat_long$n_eff
+
+##### n_eff ~ n_nom
+# Plot n_nom_means & n_eff across all return years
+ggplot(data=fig_dat_long, aes(x=n_nom,y=n_eff,group=return_yr,fill=return_yr))+
+  geom_point(size=3,pch=21)+
+  geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed")+
+  xlab("Mean Nominal Sample Size")+
+  ylab("Calculated n_eff")
+
+# Plot n_nom_means & n_eff for each return year
+ggplot(data=fig_dat_long, aes(x=n_nom,y=n_eff,group=return_yr))+
+  geom_point()+
+  geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed")+
+  facet_wrap(return_yr~.)+
+  xlab("Mean Nominal Sample Size")+
+  ylab("Calculated n_eff")
+
+##### n_diffs
+# Plot difference between n_nom & n_eff across trt (all yrs combined)
+# plot(x=fig_dat_long$trt,y=fig_dat_long$n_diff, main="n_diff = n_samp - n_eff")
+
+# Plot difference between n_nom & n_eff across trt (yr facets)
+ggplot(data=fig_dat_long, aes(x=trt,y=n_diff,group=return_yr))+
+  geom_point()+
+  geom_abline(intercept = 0, slope = 0, color = "red", linetype = "dashed")+
+  facet_wrap(return_yr~.)+
+  xlab("Sampling Rate")+
+  ylab("Difference (n_nom - n_eff")
+
+# Plot difference between n_nom & n_eff across n_nom
+ggplot(data=fig_dat_long, aes(x=n_nom,y=n_diff,group=return_yr))+
+  geom_point()+
+  geom_abline(intercept = 0, slope = 0, color = "red", linetype = "dashed")+
+  facet_wrap(return_yr~.)+
+  xlab("Mean Nominal Sample Size")+
+  ylab("Difference (n_nom - n_eff)")
+
+```
+
+# **Species-level Estimator**
+
+In this section, effective sample size is calculated using all years of age data combined.
+
+## Resample Age Data
+
+```{r boot_sp}
+### Set up bootstrapping parameters
+age_comps_real_sp <-list()
+age_comps_sim_trt <-list()
+age_comps_sim_sp <-list()
+age_data_sim <-list()
+n_nom_sp <-list()
+samp_rate <-c(seq(0.1,1,0.1))
+# print(Sys.time())
+# sp=b=s=1
+
+for(sp in 1:length(sp_name_list)){
+  age_comps_real <-list()
+  n_nom_trt <-list()
+
+  ### Calc real age comps for each year
+  age_data_sp <-dplyr::filter(age_data, species_description==sp_name_list[sp])
+  age_data_tab_real <-table(age_data_sp$gilbert_rich_int)
+
+  age_vec   <-c(as.numeric(ifelse(is.na(age_data_tab_real["1"])==FALSE,age_data_tab_real["1"],0)),
+                as.numeric(ifelse(is.na(age_data_tab_real["2"])==FALSE,age_data_tab_real["2"],0)),
+                as.numeric(ifelse(is.na(age_data_tab_real["3"])==FALSE,age_data_tab_real["3"],0)),
+                as.numeric(ifelse(is.na(age_data_tab_real["4"])==FALSE,age_data_tab_real["4"],0)),
+                as.numeric(ifelse(is.na(age_data_tab_real["5"])==FALSE,age_data_tab_real["5"],0)),
+                as.numeric(ifelse(is.na(age_data_tab_real["6"])==FALSE,age_data_tab_real["6"],0)))
+  
+  age_comps_real[[sp]] <-age_vec/sum(age_vec)
+  
+  samp_dates <-sort(unique(age_data_sp$month_date))
+
+
+  for(s in 1:length(samp_rate)){
+    age_comps_b <-list()
+    n_nom_b <-list()
+    # message("Treatment: ",samp_rate[[s]])
+    
+    for(b in 1:n_boot){
+      # print(b)
+      set.seed(bootest.seed[b])
+      age_comps_sim <-list()
+      age_data_sim <-list()
+        
+      for(sd in 1:length(samp_dates)){
+          age_data_sp_sd <-dplyr::filter(age_data_sp, month_date==samp_dates[sd])
+          age_data_sim[[sd]] <-sample(age_data_sp_sd$gilbert_rich_int,size=floor(round(nrow(age_data_sp_sd)*samp_rate[s])),replace=TRUE)
+      }
+      names(age_data_sim) <-samp_dates
+      age_data_sim_df <-map_df(age_data_sim,~as.data.frame(.))
+      age_data_tab_sim <-table(age_data_sim_df)
+      
+      age_vec_sim<-c(as.numeric(ifelse(is.na(age_data_tab_sim["1"])==FALSE,age_data_tab_sim["1"],0)),
+                     as.numeric(ifelse(is.na(age_data_tab_sim["2"])==FALSE,age_data_tab_sim["2"],0)),
+                     as.numeric(ifelse(is.na(age_data_tab_sim["3"])==FALSE,age_data_tab_sim["3"],0)),
+                     as.numeric(ifelse(is.na(age_data_tab_sim["4"])==FALSE,age_data_tab_sim["4"],0)),
+                     as.numeric(ifelse(is.na(age_data_tab_sim["5"])==FALSE,age_data_tab_sim["5"],0)),
+                     as.numeric(ifelse(is.na(age_data_tab_sim["6"])==FALSE,age_data_tab_sim["6"],0)))
+
+      n_nom_b[[b]] <-sum(age_vec_sim)
+      age_comps_b[[b]] <-age_vec_sim/sum(age_vec_sim)
+      
+    }
+    n_nom_trt[[s]] <-n_nom_b
+    age_comps_sim_trt[[s]] <-age_comps_b
+  }
+  names(n_nom_trt) <-samp_rate
+  n_nom_sp[[sp]] <-n_nom_trt
+  age_comps_real_sp[[sp]] <-age_comps_real
+  names(age_comps_sim_trt) <-samp_rate
+  age_comps_sim_sp[[sp]] <-age_comps_sim_trt
+}
+names(n_nom_sp) <-sp_name_list
+names(age_comps_real_sp) <-sp_name_list
+names(age_comps_sim_sp) <-sp_name_list
+
+for(sp in 1:length(sp_name_list)){
+  for(s in 1:length(samp_rate)){
+    if(s==1){age_comps_sim_df <-as.data.frame(t(map_df(age_comps_sim_sp[[sp]][[s]],~as.data.frame(.))))}
+    if(s>1){
+      temp <-as.data.frame(t(map_df(age_comps_sim_sp[[sp]][[s]],~as.data.frame(.))))
+      age_comps_sim_df <-rbind(temp, age_comps_sim_df)
+    }
+  }
+}
+
+# Table of samples taken per sampling date
+sample_tab <-table(age_data[,c("month_date")])
+tab_with_sums <- as.data.frame(addmargins(sample_tab, 1)) # 1 specifies adding row margins (sums of columns)
+colnames(tab_with_sums) <-c("Date", "Count")
+tab_with_sums %>% 
+  kbl(row.names = TRUE, caption = "Table 1. Count of samples taken on each sampling date.") %>%
+  kable_classic(full_width = F, position = "left", html_font = "Cambria", fixed_thead = T)
+
+# Plot of sample count by sampling date
+ggplot(data = age_data[,c("return_yr","month_date")], aes(x = month_date)) +
+  geom_bar(fill = "steelblue", color = "white")+
+  # facet_wrap(return_yr~.)+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) # Angle x-axis labels for readability
+
+age_comps_real <-as.data.frame(rbindlist(age_comps_real_sp, fill=FALSE))
+age_comps_real$age <-seq(1,6,1)
+colnames(age_comps_real) <-c("Proportion-at-age", "Age-Class")
+age_comps_real[,c("Age-Class", "Proportion-at-age")] %>% 
+  kbl(row.names = TRUE, caption = "Table 2. Real age compositions calcualted for each species sampled") %>%
+  kable_classic(full_width = F, position = "left", html_font = "Cambria", fixed_thead = T)
+
+# print(Sys.time())
+
+
+```
+
+## Calculate data weights (n_eff) & plot
+
+```{r inputSS_sp}
+# Set 'observed' proportions to real annual age comps, calc N_bt
+# Could use mean of specimen bootstrap replicates if implemented 
+samp_suite_sp <-list()
+
+for(sp in 1:length(sp_name_list)){
+  samp_suite <-list()
+  
+  for(trt in 1:length(samp_rate)){
+    N_bt = matrix(NA, nrow=n_boot, ncol=length(sp_name_list))
+    colnames(N_bt) <-sp_name_list
+    # print(samp_rate[[trt]])
+    
+    for(bI in 1:n_boot){
+      N_bt[bI,] = t(calculate_n(boot_ct=map_df(age_comps_sim_sp[[sp]][[trt]][[bI]],~as.data.frame(.)), 
+                                obs_ct=map_df(age_comps_real_sp[[sp]],~as.data.frame(.))))
+    }
+    # # Calculate input sample size (harmonic mean across bootstrap samples)
+    Nsamp_t = array(NA,dim=length(sp_name_list))
+    Nsamp_t = apply(N_bt, MARGIN=2, FUN=harmonic.mean)
+    samp_suite[[trt]] <-Nsamp_t
+
+  }
+  names(samp_suite) <-samp_rate
+  samp_suite_sp[[sp]] <-samp_suite
+}
+names(samp_suite_sp) <-sp_name_list
+
+fig_dat                <-map_df(samp_suite_sp,~as.data.frame(.))
+colnames(fig_dat)      <-samp_rate
+fig_dat$species        <-sp_name_list
+fig_dat_long           <-melt(setDT(fig_dat), id.vars = c("species"), variable.name = "trt")
+colnames(fig_dat_long) <-c("species", "trt", "n_eff")
+fig_dat_long           <-fig_dat_long[order(fig_dat_long$species,fig_dat_long$trt),]
+
+for(sp in 1:length(sp_name_list)){
+  for(s in 1:length(samp_rate)){
+    if(s==1){
+      n_nom_df <-data.frame(n_nom = as.numeric(n_nom_sp[[sp]][[s]]))
+      n_nom_df$trt <-rep(samp_rate[[s]], n_boot)
+      n_nom_df$species <-rep(sp_name_list[[sp]], n_boot)
+    }
+    if(s>1){
+      temp <-data.frame(n_nom = as.numeric(n_nom_sp[[sp]][[s]]))
+      temp$trt <-rep(samp_rate[[s]], n_boot)
+      temp$species <-rep(sp_name_list[[sp]], n_boot)
+      n_nom_df <-rbind(n_nom_df, temp)
+    }
+  }
+}
+
+# n_nom_df_long           <-melt(setDT(n_nom_df), id.vars = c("trt"), variable.name = "return_yr")
+# colnames(n_nom_df_long) <-c("trt","return_yr","n_nom")
+n_nom_means             <-aggregate(n_nom ~ trt + species, data = n_nom_df, FUN = mean)
+# n_nom_means$return_yr   <-as.character(n_nom_means$return_yr)
+n_nom_means$trt         <-as.factor(n_nom_means$trt)
+fig_dat_long            <-left_join(fig_dat_long, n_nom_means, by = c("species","trt"))
+fig_dat_long$n_diff     <-fig_dat_long$n_nom - fig_dat_long$n_eff
+
+##### n_eff ~ n_nom
+# Plot n_nom_means & n_eff across all species
+ggplot(data=fig_dat_long, aes(x=n_nom,y=n_eff,group=species,fill=species))+
+  geom_point(size=3,pch=21)+
+  geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed")+
+  xlab("Mean Nominal Sample Size")+
+  ylab("Calculated n_eff")
+
+# Plot n_nom_means & n_eff for each species
+# ggplot(data=fig_dat_long, aes(x=n_nom,y=n_eff,group=species))+
+#   geom_point()+
+#   geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed")+
+#   facet_wrap(species~.)
+
+##### n_diffs
+# Plot difference between n_nom & n_eff across trt (all sp combined)
+# plot(x=fig_dat_long$trt,y=fig_dat_long$n_diff, main="n_diff = n_samp - n_eff")
+
+# # Plot difference between n_nom & n_eff across trt (sp facets)
+# ggplot(data=fig_dat_long, aes(x=trt,y=n_diff,group=species))+
+#   geom_point()+
+#   geom_abline(intercept = 0, slope = 0, color = "red", linetype = "dashed")+
+#   facet_wrap(species~.)+
+#   xlab("Sampling Rate")+
+#   ylab("Difference (n_nom - n_eff)")
+
+
+# Plot difference between n_nom & n_eff across n_nom
+ggplot(data=fig_dat_long, aes(x=n_nom,y=n_diff,group=species))+
+  geom_point()+
+  geom_abline(intercept = 0, slope = 0, color = "red", linetype = "dashed")+
+  facet_wrap(species~.)+
+  xlab("Mean Nominal Sample Size")+
+  ylab("Difference (n_nom - n_eff)")
+
+```
+
+# **Log-log GLMM fit of n_eff \~ n_samp**
+
+This section fits a gneralized linear model to the n_eff \~ n_samp relationship. The slope of this relationship can be interpreted as a 1% change in sampling equates to a 1% change in information content.
+
+```{r glmm}
+mod <-glmmTMB( log(n_eff) ~ 1 + log(n_nom)*( 1 + log(n_nom)),data=fig_dat_long)
+print(mod)
+LOGLOGslope <-mod[["fit"]][["par"]][[2]]
+mod_pred <-ggpredict(mod, terms = "n_nom")
+colnames(mod_pred) <-c("n_nom", "n_eff", "std.error", "conf.low", "conf.high", "group")
+
+
+base_plot <- ggplot(data = fig_dat_long, aes(x = log(n_nom), y = log(n_eff))) +
+      geom_point()
+
+base_plot +
+  geom_line(data = mod_pred, aes(x = log(n_nom), y = log(n_eff)), color = "blue", linewidth = 1) +
+  geom_ribbon(data = mod_pred, aes(x = log(n_nom), ymin = log(conf.low), ymax = log(conf.high)), alpha = 0.2, fill = "lightblue4")
+
+
+```

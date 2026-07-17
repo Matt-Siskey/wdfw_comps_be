@@ -17,9 +17,9 @@ params:
   system: "Wallace River" #"Puyallup River"
 ---
 
-------------------------------------------------------------------------
-Last Updated `r format(Sys.time(), '%m/%d/%Y')`
-------------------------------------------------------------------------
+|                                                 |
+|:------------------------------------------------|
+| Last Updated `r format(Sys.time(), '%m/%d/%Y')` |
 
 \
 \
@@ -81,25 +81,46 @@ age_data$gilbert_rich_int <-as.numeric(age_data$gilbert_rich_int)
 ```{r boot}
 ### Set up bootstrapping parameters
 age_comps_real_sp <-list()
+age_comps_real_sp_y <-list()
 age_comps_sim_trt <-list()
 age_comps_sim_sp <-list()
 age_data_sim <-list()
-n_nom_sp <-list()
+n_nom_real_sp <-list()
+n_nom_sim_sp <-list()
 samp_rate <-c(seq(0.1,1,0.1))
 # print(Sys.time())
-# sp=b=1
-# s=10
+# sp=b=s=1
 # y=4
 
 for(sp in 1:length(sp_name_list)){
   age_comps_real <-list()
-  n_nom_trt <-list()
+  n_nom_real_trt <-list()
+  n_nom_sim_trt <-list()
   yrs <-sort(unique(dplyr::filter(age_data, species_description==sp_name_list[sp])$return_yr))
 
   for(s in 1:length(samp_rate)){
     age_comps_b <-list()
-    n_nom_b <-list()
+    n_nom_sim_b <-list()
+    n_nom_real_b <-list()
     print(samp_rate[[s]])
+    
+    ####################################################################
+    ### Calc real age comps & sim age comps boots for all years combined
+    age_data_sp <-dplyr::filter(age_data, species_description==sp_name_list[sp])
+    age_data_sp_tab_real <-table(age_data_sp$gilbert_rich_int)
+
+    age_vec_sp   <-c(as.numeric(ifelse(is.na(age_data_sp_tab_real["1"])==FALSE,age_data_sp_tab_real["1"],0)),
+                     as.numeric(ifelse(is.na(age_data_sp_tab_real["2"])==FALSE,age_data_sp_tab_real["2"],0)),
+                     as.numeric(ifelse(is.na(age_data_sp_tab_real["3"])==FALSE,age_data_sp_tab_real["3"],0)),
+                     as.numeric(ifelse(is.na(age_data_sp_tab_real["4"])==FALSE,age_data_sp_tab_real["4"],0)),
+                     as.numeric(ifelse(is.na(age_data_sp_tab_real["5"])==FALSE,age_data_sp_tab_real["5"],0)),
+                     as.numeric(ifelse(is.na(age_data_sp_tab_real["6"])==FALSE,age_data_sp_tab_real["6"],0)))
+    
+    age_comps_real_sp[[y]] <-age_vec_sp/sum(age_vec_sp)
+    
+    samp_dates_sp <-unique(age_data$month_date)
+    age_data_sim_sp <-list()
+
     
     for(b in 1:n_boot){
       print(b)
@@ -107,6 +128,29 @@ for(sp in 1:length(sp_name_list)){
       age_comps_sim <-list()
       n_nom_y <-list()
       
+      
+      for(sd in 1:length(samp_dates_sp)){
+        age_data_sp_sd <-dplyr::filter(age_data, month_date==samp_dates[sd])
+        age_data_sim_sp[[sd]] <-sample(age_data_sp_sd$gilbert_rich_int,size=floor(round(nrow(age_data_sp_sd)*samp_rate[s])),replace=TRUE)
+      }
+      
+      names(age_data_sim_sp) <-samp_dates_sp
+      age_data_sim_sp_df <-map_df(age_data_sim_sp,~as.data.frame(.))
+      age_data_tab_sim_sp <-table(age_data_sim_sp_df)
+      
+      age_vec_sim_sp<-c(as.numeric(ifelse(is.na(age_data_tab_sim_sp["1"])==FALSE,age_data_tab_sim_sp["1"],0)),
+                        as.numeric(ifelse(is.na(age_data_tab_sim_sp["2"])==FALSE,age_data_tab_sim_sp["2"],0)),
+                        as.numeric(ifelse(is.na(age_data_tab_sim_sp["3"])==FALSE,age_data_tab_sim_sp["3"],0)),
+                        as.numeric(ifelse(is.na(age_data_tab_sim_sp["4"])==FALSE,age_data_tab_sim_sp["4"],0)),
+                        as.numeric(ifelse(is.na(age_data_tab_sim_sp["5"])==FALSE,age_data_tab_sim_sp["5"],0)),
+                        as.numeric(ifelse(is.na(age_data_tab_sim_sp["6"])==FALSE,age_data_tab_sim_sp["6"],0)))
+
+      
+      n_nom_real_b[[b]] <-sum(age_vec_sim_sp)
+      age_comps_sim_b[[b]] <-age_vec_sim_sp/sum(age_vec_sim_sp)
+      
+      ###########################################################
+      ### Calc real age comps & sim age comps boots for each year
       for(y in 1:length(yrs)){
         ### Calc real age comps for each year
         age_data_sp_y <-dplyr::filter(age_data, species_description==sp_name_list[sp] & return_yr==yrs[y])
@@ -125,13 +169,10 @@ for(sp in 1:length(sp_name_list)){
         age_data_sim <-list()
         
         for(sd in 1:length(samp_dates)){
-          
-          # for(or in 1:length(origin)){
-            age_data_sp_y_sd <-dplyr::filter(age_data_sp_y, month_date==samp_dates[sd])
-            age_data_sim[[sd]] <-sample(age_data_sp_y_sd$gilbert_rich_int,size=floor(round(nrow(age_data_sp_y_sd)*samp_rate[s])),replace=TRUE)
-          # }
-        
+          age_data_sp_y_sd <-dplyr::filter(age_data_sp_y, month_date==samp_dates[sd])
+          age_data_sim[[sd]] <-sample(age_data_sp_y_sd$gilbert_rich_int,size=floor(round(nrow(age_data_sp_y_sd)*samp_rate[s])),replace=TRUE)
         }
+        
         names(age_data_sim) <-samp_dates
         age_data_sim_df <-map_df(age_data_sim,~as.data.frame(.))
         age_data_tab_sim <-table(age_data_sim_df)
@@ -147,21 +188,24 @@ for(sp in 1:length(sp_name_list)){
         age_comps_sim[[y]] <-age_vec_sim/sum(age_vec_sim)
       }
       names(n_nom_y) <-yrs
-      n_nom_b[[b]] <-n_nom_y
+      n_nom_sim_b[[b]] <-n_nom_y
       names(age_comps_real) <-yrs
       names(age_comps_sim) <-yrs
       age_comps_b[[b]] <-age_comps_sim
     }
-    n_nom_trt[[s]] <-n_nom_b
+    n_nom_real_trt[[s]] <-n_nom_real_b
+    n_nom_sim_trt[[s]] <-n_nom_sim_b
     age_comps_sim_trt[[s]] <-age_comps_b
   }
-  names(n_nom_trt) <-samp_rate
+  names(n_nom_real_trt) <-samp_rate
+  names(n_nom_sim_trt) <-samp_rate
   n_nom_sp[[sp]] <-n_nom_trt
   age_comps_real_sp[[sp]] <-age_comps_real
   names(age_comps_sim_trt) <-samp_rate
   age_comps_sim_sp[[sp]] <-age_comps_sim_trt
 }
-names(n_nom_sp) <-sp_name_list
+names(n_nom_real_sp) <-sp_name_list
+names(n_nom_sim_sp) <-sp_name_list
 names(age_comps_real_sp) <-sp_name_list
 names(age_comps_sim_sp) <-sp_name_list
 
@@ -304,7 +348,7 @@ ggplot(data=fig_dat_long, aes(x=n_nom,y=n_diff,group=return_yr))+
 
 ```
 
-## Log-log GLMM fit of n_eff ~ n_samp
+## Log-log GLMM fit of n_eff \~ n_samp
 
 ```{r glmm}
 mod <-glmmTMB( log(n_eff) ~ 1 + log(n_samp)*( 1 + log(n_samp)),data=fig_dat)
